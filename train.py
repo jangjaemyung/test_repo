@@ -404,21 +404,6 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             
 
 
-            #print("before")
-            #signature = None
-   
-            #with amp.autocast(enabled=cuda):
-            #    pred = model(imgs)  # forward
-    
-    # It produces the signature to MLFlow model if is not set yet.
-            #if signature is None:
-            #    signature = infer_signature(
-            #        imgs.cpu().numpy(),
-            #        pred[0].detach().cpu().numpy()
-            #    )
-            #/
-            #print("after")
-            # Save model
             if (not nosave) or (final_epoch and not evolve):  # if save
                 ckpt = {
                     'epoch': epoch,
@@ -438,15 +423,15 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     mlflow.pytorch.log_model(
                         ckpt['model'],
                         "yolov5",
-                        signature=signature
+                        signature=signature,
+                        registered_model_name="pytorch"
                     )
                 if opt.save_period > 0 and epoch % opt.save_period == 0:
                     torch.save(ckpt, w / f'epoch{epoch}.pt')
                 del ckpt
                 callbacks.run('on_model_save', last, epoch, final_epoch, best_fitness, fi)
-                print("1")
-                mlflow.log_artifacts(w)
-                print("2")
+                print("artifacts_path= "+ str(w))
+                mlflow.log_artifacts(str(w),artifact_path="states")
 
         # EarlyStopping
         if RANK != -1:  # if DDP training
@@ -532,6 +517,11 @@ def parse_opt(known=False):
     parser.add_argument('--bbox_interval', type=int, default=-1, help='Set bounding-box image logging interval')
     parser.add_argument('--artifact_alias', type=str, default='latest', help='Version of dataset artifact to use')
 
+    # mlflow arguments
+    parser.add_argument('--mlip', type=str, default='http://211.46.241.212:32627', help='input your mlflow ip')
+    parser.add_argument('--minioip', type=str, default='http://211.46.241.212:30333', help='input your minio ip')
+    parser.add_argument('--minioid', type=str, default='minio', help='input your minio-id, default=minio')
+    parser.add_argument('--miniopw', type=str, default='minio123', help='input your minio-pw, default=minio123')
     return parser.parse_known_args()[0] if known else parser.parse_args()
 
 
@@ -582,16 +572,21 @@ def main(opt, callbacks=Callbacks()):
         dist.init_process_group(backend='nccl' if dist.is_nccl_available() else 'gloo')
 
     # Train
+    print(opt.minioid)
+    print(opt.miniopw)
     if not opt.evolve:
-        os.environ["AWS_ACCESS_KEY_ID"] = "minio"
-        os.environ["AWS_SECRET_ACCESS_KEY"] = "minio123"
-        os.environ["MLFLOW_S3_ENDPOINT_URL"] = f"http://211.46.241.212:30333"
-        MLFLOW_URL=f"http://211.46.241.212:32627"
+        os.environ["AWS_ACCESS_KEY_ID"] = opt.minioid #"minio"
+        os.environ["AWS_SECRET_ACCESS_KEY"] = opt.miniopw
+        os.environ["MLFLOW_S3_ENDPOINT_URL"] = opt.minioip #f"http://211.46.241.212:30333"
+        MLFLOW_URL= opt.mlip # f"http://211.46.241.212:32627"
         MLFLOW_EXP_NAME="yolov5"
         mlflow.set_tracking_uri(MLFLOW_URL)   #http://211.46.241.212:32627/
         mlflow.set_experiment(MLFLOW_EXP_NAME)
+        #train(opt.hyp, opt, device, callbacks)
         with mlflow.start_run(run_name=opt.name,nested=True):
             train(opt.hyp, opt, device, callbacks)
+            run = mlflow.active_run()
+            print("Active run_id: {}".format(run.info.run_id))
 
     # Evolve hyperparameters (optional)
     else:
@@ -682,10 +677,12 @@ def main(opt, callbacks=Callbacks()):
             # Write mutation results
             keys = ('metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/mAP_0.5:0.95', 'val/box_loss',
                     'val/obj_loss', 'val/cls_loss')
+            print("soon")
             print_mutation(keys, results, hyp.copy(), save_dir, opt.bucket)
 
         # Plot results
         plot_evolve(evolve_csv)
+        mlflow.end_run()
         LOGGER.info(f'Hyperparameter evolution finished {opt.evolve} generations\n'
                     f"Results saved to {colorstr('bold', save_dir)}\n"
                     f'Usage example: $ python train.py --hyp {evolve_yaml}')
