@@ -25,6 +25,9 @@ import time
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
+import mlflow
+from mlflow.models.signature import infer_signature
+#mlflow.set_registry_uri("s3://211.46.241.212:30334/mlflow")
 
 try:
     import comet_ml  # must be imported before torch (if installed)
@@ -83,10 +86,17 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     (w.parent if evolve else w).mkdir(parents=True, exist_ok=True)  # make dir
     last, best = w / 'last.pt', w / 'best.pt'
 
+    for opt_key in opt.__dict__:
+        opt_value = opt.__dict__[opt_key]
+        print(opt_value)
+        if opt_value is not None and opt_value != '':
+            mlflow.log_param(opt_key, opt_value)
+
     # Hyperparameters
     if isinstance(hyp, str):
         with open(hyp, errors='ignore') as f:
             hyp = yaml.safe_load(f)  # load hyps dict
+            mlflow.log_params({F'hyper_{key}': hyp[key] for key in hyp})
     LOGGER.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items()))
     opt.hyp = hyp.copy()  # for saving hyps to checkpoints
 
@@ -311,7 +321,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 if sf != 1:
                     ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
                     imgs = nn.functional.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
-
+            signature= None
             # Forward
             with torch.cuda.amp.autocast(amp):
                 pred = model(imgs)  # forward
@@ -320,6 +330,12 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
                 if opt.quad:
                     loss *= 4.
+
+            if signature is None:
+                signature = infer_signature(
+                        imgs.cpu().numpy(),
+                        pred[0].detach().cpu().numpy()
+                )
 
             # Backward
             scaler.scale(loss).backward()
@@ -375,7 +391,33 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 best_fitness = fi
             log_vals = list(mloss) + list(results) + lr
             callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, fi)
+            # mlflow
 
+            mlflow.log_metric("P", results[0], step=epoch)
+            mlflow.log_metric("R", results[1], step=epoch)
+            mlflow.log_metric("mAP.5", results[2], step=epoch) 
+            mlflow.log_metric("mAP.5-.95", results[3], step=epoch)
+            mloss_cpu = mloss.cpu().numpy()
+            mlflow.log_metric("box", mloss_cpu[0], step=epoch)
+            mlflow.log_metric("obj", mloss_cpu[1], step=epoch)
+            mlflow.log_metric("cls", mloss_cpu[2], step=epoch)
+            
+
+
+            #print("before")
+            #signature = None
+   
+            #with amp.autocast(enabled=cuda):
+            #    pred = model(imgs)  # forward
+    
+    # It produces the signature to MLFlow model if is not set yet.
+            #if signature is None:
+            #    signature = infer_signature(
+            #        imgs.cpu().numpy(),
+            #        pred[0].detach().cpu().numpy()
+            #    )
+            #/
+            #print("after")
             # Save model
             if (not nosave) or (final_epoch and not evolve):  # if save
                 ckpt = {
@@ -388,15 +430,23 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     'opt': vars(opt),
                     'git': GIT_INFO,  # {remote, branch, commit} if a git repo
                     'date': datetime.now().isoformat()}
-
+         
                 # Save last, best and delete
                 torch.save(ckpt, last)
                 if best_fitness == fi:
                     torch.save(ckpt, best)
+                    mlflow.pytorch.log_model(
+                        ckpt['model'],
+                        "yolov5",
+                        signature=signature
+                    )
                 if opt.save_period > 0 and epoch % opt.save_period == 0:
                     torch.save(ckpt, w / f'epoch{epoch}.pt')
                 del ckpt
                 callbacks.run('on_model_save', last, epoch, final_epoch, best_fitness, fi)
+                print("1")
+                mlflow.log_artifacts(w)
+                print("2")
 
         # EarlyStopping
         if RANK != -1:  # if DDP training
@@ -533,7 +583,16 @@ def main(opt, callbacks=Callbacks()):
 
     # Train
     if not opt.evolve:
+        os.environ["AWS_ACCESS_KEY_ID"] = "minio"
+        os.environ["AWS_SECRET_ACCESS_KEY"] = "minio123"
+        os.environ["MLFLOW_S3_ENDPOINT_URL"] = f"http://211.46.241.212:30333"
+        MLFLOW_URL=f"http://211.46.241.212:32627"
+        MLFLOW_EXP_NAME="yolov5"
+        mlflow.set_tracking_uri(MLFLOW_URL)   #http://211.46.241.212:32627/
+        mlflow.set_experiment(MLFLOW_EXP_NAME)
         train(opt.hyp, opt, device, callbacks)
+        with mlflow.start_run(run_name=opt.name,nested=True):
+            train(opt.hyp, opt, device, callbacks)
 
     # Evolve hyperparameters (optional)
     else:
@@ -631,6 +690,7 @@ def main(opt, callbacks=Callbacks()):
         LOGGER.info(f'Hyperparameter evolution finished {opt.evolve} generations\n'
                     f"Results saved to {colorstr('bold', save_dir)}\n"
                     f'Usage example: $ python train.py --hyp {evolve_yaml}')
+        # mlflow.end_run()
 
 
 def run(**kwargs):
