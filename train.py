@@ -590,7 +590,6 @@ def main(opt, callbacks=Callbacks()):
         MLFLOW_EXP_NAME="yolov5"
         mlflow.set_tracking_uri(MLFLOW_URL)   #http://211.46.241.212:32627/
         mlflow.set_experiment(MLFLOW_EXP_NAME)
-        train(opt.hyp, opt, device, callbacks)
         with mlflow.start_run(run_name=opt.name,nested=True):
             train(opt.hyp, opt, device, callbacks)
 
